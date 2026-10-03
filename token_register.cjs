@@ -1278,11 +1278,17 @@ async function main() {
                     continue;
                 }
                 if (challenge.data?.retry_after) {
-                    console.log(C.yellow(`  ⚠  Proxy ${proxyObj?.ip || ''} bị Rate-limit (${challenge.data.retry_after}s). Tự động xoay sang proxy khác trong pool...`));
-                    if (proxyObj) proxyPool.markRateLimited(proxyObj.url, challenge.data.retry_after);
-                    if (proxyPool.enabled) {
-                        proxyObj = proxyPool.getProxyForAccount(i + attempt + 1);
-                        console.log(C.blue(`  🔄 Đã xoay sang Proxy mới: ${proxyObj ? proxyObj.ip : 'Direct'}`));
+                    console.log(C.yellow(`  ⚠  ${proxyObj ? 'Proxy ' + proxyObj.ip : 'Direct IP'} bị Rate-limit (${challenge.data.retry_after}s).`));
+                    if (proxyObj) {
+                        proxyPool.markRateLimited(proxyObj.url, challenge.data.retry_after);
+                        if (proxyPool.enabled) {
+                            proxyObj = proxyPool.getProxyForAccount(i + attempt + 1);
+                            console.log(C.blue(`  🔄 Đã xoay sang Proxy mới: ${proxyObj ? proxyObj.ip : 'Direct'}`));
+                        }
+                    } else {
+                        const waitSec = Math.ceil(challenge.data.retry_after) + 2;
+                        console.log(C.yellow(`  ⏳ Đang đợi hết rate-limit Direct IP (${waitSec}s)...`));
+                        await sleep(waitSec * 1000);
                     }
                     continue;
                 }
