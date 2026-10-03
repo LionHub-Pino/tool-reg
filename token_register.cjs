@@ -40,9 +40,6 @@ const crypto = require('crypto');
 const { URL } = require('url');
 const WebSocket = require('ws');
 
-const { execFile } = require('child_process');
-const BRIDGE_PATH = path.join(__dirname, 'http_bridge.py');
-
 let HttpsProxyAgent = null;
 try {
     HttpsProxyAgent = require('https-proxy-agent').HttpsProxyAgent;
@@ -55,7 +52,7 @@ try {
 // ─── CONFIG ────────────────────────────────────────
 const CONFIG = {
     API_BASE: 'https://discord.com/api/v9',
-    CAPTCHA_PORT: 7890,
+    CAPTCHA_PORT: parseInt(process.env.PORT || process.env.SERVER_PORT || 7890, 10),
     WEBHOOK_URL: 'https://discord.com/api/webhooks/1547577083125956729/F1OCPwzXRCIyCEXJvHZOP8-AcLUGimbVmkrylWm0Lc6iaEDZcE5VD8v7655jQyHOfUZc',
     PROXY_FILE: path.join(__dirname, 'proxy.txt'),
     RESULTS_DIR: path.join(__dirname, 'results'),
@@ -915,24 +912,70 @@ function getSuperProperties() {
     return Buffer.from(JSON.stringify(props)).toString('base64');
 }
 
-// ─── DISCORD TLS-FRIENDLY HTTP BRIDGE ─────────────
-function discordHttp({ url, method = 'GET', headers = {}, data = null, proxy = null, timeout = 15, sessionId = null }) {
-    return new Promise((resolve) => {
-        const payload = JSON.stringify({ url, method, headers, data, proxy, timeout, session_id: sessionId });
-        const child = execFile('python3', [BRIDGE_PATH], { maxBuffer: 10 * 1024 * 1024 }, (err, stdout) => {
-            if (err) {
-                return resolve({ status: 0, error: err.message });
+// ─── 100% PURE JS DISCORD HTTP CLIENT (ZERO PYTHON DEPENDENCY) ───
+const cookieJars = new Map();
+
+async function discordHttp({ url, method = 'GET', headers = {}, data = null, proxy = null, timeout = 15, sessionId = null }) {
+    try {
+        const reqHeaders = { ...headers };
+        if (sessionId) {
+            if (!cookieJars.has(sessionId)) cookieJars.set(sessionId, new Map());
+            const jar = cookieJars.get(sessionId);
+            const cookieStr = Array.from(jar.entries()).map(([k, v]) => `${k}=${v}`).join('; ');
+            if (cookieStr) {
+                reqHeaders['Cookie'] = reqHeaders['Cookie'] ? `${reqHeaders['Cookie']}; ${cookieStr}` : cookieStr;
             }
-            try {
-                const res = JSON.parse(stdout.trim());
-                resolve(res);
-            } catch (e) {
-                resolve({ status: 0, error: 'JSON parse error: ' + stdout });
+        }
+
+        const axiosOpts = {
+            url,
+            method: method.toUpperCase(),
+            headers: reqHeaders,
+            data: data !== null ? data : undefined,
+            timeout: timeout * 1000,
+            validateStatus: () => true,
+            maxRedirects: 5
+        };
+
+        if (proxy && HttpsProxyAgent) {
+            const agent = new HttpsProxyAgent(proxy);
+            axiosOpts.httpAgent = agent;
+            axiosOpts.httpsAgent = agent;
+        }
+
+        const res = await axios(axiosOpts);
+
+        if (sessionId && res.headers['set-cookie']) {
+            const jar = cookieJars.get(sessionId);
+            const setCookies = Array.isArray(res.headers['set-cookie']) ? res.headers['set-cookie'] : [res.headers['set-cookie']];
+            for (const sc of setCookies) {
+                const parts = sc.split(';')[0].split('=');
+                if (parts.length >= 2) {
+                    jar.set(parts[0].trim(), parts.slice(1).join('=').trim());
+                }
             }
-        });
-        child.stdin.write(payload);
-        child.stdin.end();
-    });
+        }
+
+        const finalUrl = res.request?.res?.responseUrl || res.config?.url || url;
+        const cookiesList = sessionId && cookieJars.has(sessionId)
+            ? Array.from(cookieJars.get(sessionId).entries()).map(([k, v]) => `${k}=${v}`).join('; ')
+            : '';
+
+        return {
+            status: res.status,
+            data: res.data,
+            final_url: finalUrl,
+            headers: res.headers,
+            cookies: cookiesList
+        };
+    } catch (err) {
+        return {
+            status: 0,
+            error: err.message,
+            data: null,
+            headers: {}
+        };
+    }
 }
 
 // ─── DISCORD REGISTRATION PIPELINE ────────────────

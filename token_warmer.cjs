@@ -20,8 +20,6 @@ const path = require('path');
 const crypto = require('crypto');
 const axios = require('axios');
 const WebSocket = require('ws');
-const { execFile } = require('child_process');
-
 let HttpsProxyAgent = null;
 try {
     HttpsProxyAgent = require('https-proxy-agent').HttpsProxyAgent;
@@ -30,8 +28,6 @@ try {
         HttpsProxyAgent = require('https-proxy-agent');
     } catch {}
 }
-
-const BRIDGE_PATH = path.join(__dirname, 'http_bridge.py');
 
 // ─── CONFIG ────────────────────────────────────────
 const CONFIG = {
@@ -117,21 +113,35 @@ class ProxyPool {
     }
 }
 
-// ─── HTTP BRIDGE ───────────────────────────────────
-function discordHttp({ url, method = 'GET', headers = {}, data = null, proxy = null, timeout = 12 }) {
-    return new Promise((resolve) => {
-        const payload = JSON.stringify({ url, method, headers, data, proxy, timeout });
-        const child = execFile('python3', [BRIDGE_PATH], { maxBuffer: 10 * 1024 * 1024 }, (err, stdout) => {
-            if (err) return resolve({ status: 0, error: err.message });
-            try {
-                resolve(JSON.parse(stdout.trim()));
-            } catch (e) {
-                resolve({ status: 0, error: 'JSON parse error: ' + stdout });
-            }
-        });
-        child.stdin.write(payload);
-        child.stdin.end();
-    });
+// ─── 100% PURE JS DISCORD HTTP CLIENT ──────────────
+async function discordHttp({ url, method = 'GET', headers = {}, data = null, proxy = null, timeout = 12 }) {
+    try {
+        const axiosOpts = {
+            url,
+            method: method.toUpperCase(),
+            headers: { ...headers },
+            data: data !== null ? data : undefined,
+            timeout: timeout * 1000,
+            validateStatus: () => true
+        };
+        if (proxy && HttpsProxyAgent) {
+            const agent = new HttpsProxyAgent(proxy);
+            axiosOpts.httpAgent = agent;
+            axiosOpts.httpsAgent = agent;
+        }
+        const res = await axios(axiosOpts);
+        return {
+            status: res.status,
+            data: res.data,
+            headers: res.headers
+        };
+    } catch (err) {
+        return {
+            status: 0,
+            error: err.message,
+            data: null
+        };
+    }
 }
 
 function getSuperProperties() {
