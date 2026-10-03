@@ -282,12 +282,12 @@ class TempMailManager {
             };
         }
 
-        // Chu kỳ thử nghiệm các email provider uy tín
-        let chosen = 'guerrilla';
+        // Chu kỳ thử nghiệm các email provider uy tín (Ưu tiên tempmaillol)
+        let chosen = 'tempmaillol';
         if (preferredProvider && preferredProvider !== 'auto') {
             chosen = preferredProvider;
         } else {
-            const cycle = ['guerrilla', 'tempmaillol', 'mailtm'];
+            const cycle = ['tempmaillol', 'mailtm', 'guerrilla'];
             chosen = cycle[attempt % cycle.length];
         }
 
@@ -1092,7 +1092,7 @@ function parseArgs() {
         customUsername: null,
         customEmail: null,
         webhookUrl: CONFIG.WEBHOOK_URL,
-        provider: 'auto',
+        provider: 'tempmaillol',
     };
 
     for (let i = 0; i < args.length; i++) {
