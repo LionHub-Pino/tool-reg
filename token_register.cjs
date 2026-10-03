@@ -884,10 +884,31 @@ function startCaptchaServer() {
     });
 }
 
+// ─── DISCORD CLIENT PROPERTIES ───────────────────
+function getSuperProperties() {
+    const props = {
+        os: "Windows",
+        browser: "Chrome",
+        device: "",
+        system_locale: "en-US",
+        browser_user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        browser_version: "131.0.0.0",
+        os_version: "10",
+        referrer: "",
+        referring_domain: "",
+        referrer_current: "",
+        referring_domain_current: "",
+        release_channel: "stable",
+        client_build_number: 344837,
+        client_event_source: null
+    };
+    return Buffer.from(JSON.stringify(props)).toString('base64');
+}
+
 // ─── DISCORD TLS-FRIENDLY HTTP BRIDGE ─────────────
-function discordHttp({ url, method = 'GET', headers = {}, data = null, proxy = null, timeout = 15 }) {
+function discordHttp({ url, method = 'GET', headers = {}, data = null, proxy = null, timeout = 15, sessionId = null }) {
     return new Promise((resolve) => {
-        const payload = JSON.stringify({ url, method, headers, data, proxy, timeout });
+        const payload = JSON.stringify({ url, method, headers, data, proxy, timeout, session_id: sessionId });
         const child = execFile('python3', [BRIDGE_PATH], { maxBuffer: 10 * 1024 * 1024 }, (err, stdout) => {
             if (err) {
                 return resolve({ status: 0, error: err.message });
@@ -905,17 +926,20 @@ function discordHttp({ url, method = 'GET', headers = {}, data = null, proxy = n
 }
 
 // ─── DISCORD REGISTRATION PIPELINE ────────────────
-async function fetchFingerprint(proxyUrl) {
+async function fetchFingerprint(proxyUrl, sessionId = null) {
     try {
+        const superProps = getSuperProperties();
         const res = await discordHttp({
             url: `${CONFIG.API_BASE}/experiments`,
             method: 'GET',
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0 Safari/537.36',
-                'Accept': '*/*'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                'Accept': '*/*',
+                'X-Super-Properties': superProps
             },
             proxy: proxyUrl,
-            timeout: CONFIG.TIMEOUT / 1000
+            timeout: CONFIG.TIMEOUT / 1000,
+            sessionId
         });
         return res.data?.fingerprint || null;
     } catch {
@@ -923,7 +947,8 @@ async function fetchFingerprint(proxyUrl) {
     }
 }
 
-async function requestChallenge({ username, email, password, dob, proxyUrl }) {
+async function requestChallenge({ username, email, password, dob, proxyUrl, fingerprint = null, sessionId = null }) {
+    const superProps = getSuperProperties();
     const payload = {
         email,
         username,
@@ -940,7 +965,9 @@ async function requestChallenge({ username, email, password, dob, proxyUrl }) {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
         'Accept': '*/*',
         'Origin': 'https://discord.com',
-        'Referer': 'https://discord.com/register'
+        'Referer': 'https://discord.com/register',
+        'X-Super-Properties': superProps,
+        ...(fingerprint ? { 'X-Fingerprint': fingerprint } : {})
     };
 
     const res = await discordHttp({
@@ -949,7 +976,8 @@ async function requestChallenge({ username, email, password, dob, proxyUrl }) {
         headers,
         data: payload,
         proxy: proxyUrl,
-        timeout: CONFIG.TIMEOUT / 1000
+        timeout: CONFIG.TIMEOUT / 1000,
+        sessionId
     });
 
     if (res.data?.captcha_sitekey) {
@@ -970,7 +998,8 @@ async function requestChallenge({ username, email, password, dob, proxyUrl }) {
     return { needsCaptcha: false, status: res.status, data: res.data };
 }
 
-async function submitFinalRegistration({ username, email, password, dob, captchaKey, rqtoken, sessionId, service = 'hcaptcha', proxyUrl }) {
+async function submitFinalRegistration({ username, email, password, dob, captchaKey, rqtoken, sessionId, service = 'hcaptcha', proxyUrl, fingerprint = null, accountSessionId = null }) {
+    const superProps = getSuperProperties();
     const payload = {
         email,
         username,
@@ -982,7 +1011,7 @@ async function submitFinalRegistration({ username, email, password, dob, captcha
         unique_username_registration: true,
         captcha_key: captchaKey,
         captcha_service: service || 'hcaptcha',
-        captcha_rqtoken: rqtoken || undefined,
+        ...(rqtoken ? { captcha_rqtoken: rqtoken } : {}),
     };
 
     const headers = {
@@ -992,6 +1021,8 @@ async function submitFinalRegistration({ username, email, password, dob, captcha
         'Origin': 'https://discord.com',
         'Referer': 'https://discord.com/register',
         'X-Captcha-Key': captchaKey,
+        'X-Super-Properties': superProps,
+        ...(fingerprint ? { 'X-Fingerprint': fingerprint } : {}),
         ...(rqtoken ? { 'X-Captcha-Rqtoken': rqtoken } : {}),
         ...(sessionId ? { 'X-Captcha-Session-Id': sessionId } : {}),
         ...(service ? { 'X-Captcha-Service': service } : {}),
@@ -1003,7 +1034,8 @@ async function submitFinalRegistration({ username, email, password, dob, captcha
         headers,
         data: payload,
         proxy: proxyUrl,
-        timeout: CONFIG.TIMEOUT / 1000
+        timeout: CONFIG.TIMEOUT / 1000,
+        sessionId: accountSessionId
     });
 
     return { status: res.status, data: res.data };
@@ -1151,13 +1183,14 @@ async function main() {
             console.log(C.gray(`  🌐 Proxy: ${proxyObj.ip}`));
         }
 
+        const accountSessionId = crypto.randomUUID();
         const username = generateUsername(opts.count === 1 ? opts.customUsername : null);
         const password = generatePassword();
         const dob = generateDOB();
 
-        // Lấy fingerprint
-        process.stdout.write(`  ${C.gray('🔍 Lấy fingerprint...')} `);
-        const fingerprint = await fetchFingerprint(proxyObj ? proxyObj.url : null);
+        // Lấy fingerprint và khởi tạo session cookie
+        process.stdout.write(`  ${C.gray('🔍 Lấy fingerprint & session...')} `);
+        const fingerprint = await fetchFingerprint(proxyObj ? proxyObj.url : null, accountSessionId);
         if (fingerprint) {
             console.log(C.green('OK'));
         } else {
@@ -1181,7 +1214,9 @@ async function main() {
                 email: activeEmailObj.address,
                 password,
                 dob,
-                proxyUrl: proxyObj ? proxyObj.url : null
+                proxyUrl: proxyObj ? proxyObj.url : null,
+                fingerprint,
+                sessionId: accountSessionId
             });
 
             if (challenge.needsCaptcha) {
@@ -1210,7 +1245,9 @@ async function main() {
                     rqtoken: challenge.rqtoken,
                     sessionId: challenge.sessionId,
                     service: challenge.service,
-                    proxyUrl: proxyObj ? proxyObj.url : null
+                    proxyUrl: proxyObj ? proxyObj.url : null,
+                    fingerprint,
+                    accountSessionId
                 });
 
                 if (submitRes.status === 200 && submitRes.data?.token) {
