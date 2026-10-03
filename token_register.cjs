@@ -991,7 +991,7 @@ async function requestChallenge({ username, email, password, dob, proxyUrl, fing
         };
     }
 
-    if (res.status === 200 && res.data?.token) {
+    if ((res.status === 200 || res.status === 201) && res.data?.token) {
         return { needsCaptcha: false, success: true, data: res.data };
     }
 
@@ -1251,7 +1251,7 @@ async function main() {
                     accountSessionId
                 });
 
-                if (submitRes.status === 200 && submitRes.data?.token) {
+                if ((submitRes.status === 200 || submitRes.status === 201) && submitRes.data?.token) {
                     finalToken = submitRes.data.token;
                     regSuccess = true;
                     console.log(C.bgGreen('THÀNH CÔNG'));
