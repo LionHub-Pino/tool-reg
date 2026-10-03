@@ -420,13 +420,13 @@ function extractDiscordLink(body) {
     const cleanBody = body.replace(/&amp;/g, '&');
     // 1. Tìm href trong thẻ <a> trước
     const hrefMatch = cleanBody.match(/href=["'](https:\/\/click\.discord\.com\/ls\/click\?upn=[^"'\s>]+)["']/i)
-        || cleanBody.match(/href=["'](https:\/\/discord\.com\/verify\?token=[^"'\s>]+)["']/i);
+        || cleanBody.match(/href=["'](https:\/\/discord\.com\/verify[?#][^"'\s>]+)["']/i);
     if (hrefMatch) return hrefMatch[1];
 
     // 2. Tìm link URL raw
     const m = cleanBody.match(/https:\/\/click\.discord\.com\/ls\/click\?upn=[^\s"'<>)]+/i)
-        || cleanBody.match(/https:\/\/discord\.com\/verify\?token=[^\s"'<>)]+/i)
-        || cleanBody.match(/https:\/\/discord\.com\/api\/v\d+\/auth\/verify\?[^\s"'<>)]+/i);
+        || cleanBody.match(/https:\/\/discord\.com\/verify[?#][^\s"'<>)]+/i)
+        || cleanBody.match(/https:\/\/discord\.com\/api\/v\d+\/auth\/verify[?#][^\s"'<>)]+/i);
     if (m) return m[0].replace(/[)>.,;'"]+$/, '');
 
     // 3. Fallback bất kỳ link Discord verify nào
@@ -1082,8 +1082,8 @@ async function verifyEmailToken(verifyUrl, token, proxyUrl, accountSessionId = n
     try {
         let emailToken = null;
 
-        // 1. Kiểm tra trực tiếp token trong query param của URL
-        const directMatch = verifyUrl.match(/[?&]token=([^&"'\s<>#]+)/i);
+        // 1. Kiểm tra trực tiếp token trong query/hash param của URL
+        const directMatch = verifyUrl.match(/[?&#]token=([^&"'\s<>#]+)/i) || verifyUrl.match(/token=([a-zA-Z0-9_\-\.]+)/i);
         if (directMatch) {
             emailToken = directMatch[1];
         }
@@ -1104,17 +1104,17 @@ async function verifyEmailToken(verifyUrl, token, proxyUrl, accountSessionId = n
             });
 
             const finalUrl = res1.final_url || '';
-            const matchFinal = finalUrl.match(/[?&]token=([^&"'\s<>#]+)/i);
+            const matchFinal = finalUrl.match(/[?&#]token=([^&"'\s<>#]+)/i) || finalUrl.match(/token=([a-zA-Z0-9_\-\.]+)/i);
             if (matchFinal) {
                 emailToken = matchFinal[1];
             } else {
                 const loc = res1.headers?.location || res1.headers?.Location || '';
-                const matchLoc = loc.match(/[?&]token=([^&"'\s<>#]+)/i);
+                const matchLoc = loc.match(/[?&#]token=([^&"'\s<>#]+)/i) || loc.match(/token=([a-zA-Z0-9_\-\.]+)/i);
                 if (matchLoc) {
                     emailToken = matchLoc[1];
                 } else {
                     const bodyStr = typeof res1.data === 'string' ? res1.data : JSON.stringify(res1.data || {});
-                    const matchBody = bodyStr.match(/[?&]token=([^&"'\s<>#]+)/i) || bodyStr.match(/"token":\s*"([^"]+)"/);
+                    const matchBody = bodyStr.match(/[?&#]token=([^&"'\s<>#]+)/i) || bodyStr.match(/token=([a-zA-Z0-9_\-\.]+)/i);
                     if (matchBody) emailToken = matchBody[1];
                 }
             }
