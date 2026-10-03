@@ -1012,6 +1012,7 @@ async function submitFinalRegistration({ username, email, password, dob, captcha
         captcha_key: captchaKey,
         captcha_service: service || 'hcaptcha',
         ...(rqtoken ? { captcha_rqtoken: rqtoken } : {}),
+        ...(sessionId ? { captcha_session_id: sessionId } : {}),
     };
 
     const headers = {
