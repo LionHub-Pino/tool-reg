@@ -70,6 +70,8 @@ def main():
             print(json.dumps({
                 'status': res.status,
                 'data': parsed,
+                'final_url': res.geturl(),
+                'headers': dict(res.headers),
                 'cookies': '; '.join(cookies_list)
             }))
     except urllib.error.HTTPError as e:
@@ -93,6 +95,8 @@ def main():
         print(json.dumps({
             'status': e.code,
             'data': parsed,
+            'final_url': e.geturl() if hasattr(e, 'geturl') else None,
+            'headers': dict(e.headers) if hasattr(e, 'headers') else {},
             'cookies': '; '.join(cookies_list)
         }))
     except Exception as e:

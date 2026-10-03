@@ -38,6 +38,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { URL } = require('url');
+const WebSocket = require('ws');
 
 const { execFile } = require('child_process');
 const BRIDGE_PATH = path.join(__dirname, 'http_bridge.py');
@@ -416,12 +417,21 @@ class TempMailManager {
 
 function extractDiscordLink(body) {
     if (!body) return null;
-    const m = body.match(/https:\/\/click\.discord\.com\/ls\/click\?upn=[^\s"'<]+/i)
-        || body.match(/https:\/\/discord\.com\/verify\?token=[^\s"'<]+/i)
-        || body.match(/https:\/\/discord\.com\/api\/v\d+\/auth\/verify\?[^\s"'<]+/i);
-    if (m) return m[0].replace(/&amp;/g, '&');
-    const fallback = body.match(/https:\/\/[^\s"'<]*discord[^\s"'<]*/i);
-    return fallback ? fallback[0].replace(/&amp;/g, '&') : null;
+    const cleanBody = body.replace(/&amp;/g, '&');
+    // 1. Tìm href trong thẻ <a> trước
+    const hrefMatch = cleanBody.match(/href=["'](https:\/\/click\.discord\.com\/ls\/click\?upn=[^"'\s>]+)["']/i)
+        || cleanBody.match(/href=["'](https:\/\/discord\.com\/verify\?token=[^"'\s>]+)["']/i);
+    if (hrefMatch) return hrefMatch[1];
+
+    // 2. Tìm link URL raw
+    const m = cleanBody.match(/https:\/\/click\.discord\.com\/ls\/click\?upn=[^\s"'<>)]+/i)
+        || cleanBody.match(/https:\/\/discord\.com\/verify\?token=[^\s"'<>)]+/i)
+        || cleanBody.match(/https:\/\/discord\.com\/api\/v\d+\/auth\/verify\?[^\s"'<>)]+/i);
+    if (m) return m[0].replace(/[)>.,;'"]+$/, '');
+
+    // 3. Fallback bất kỳ link Discord verify nào
+    const fallback = cleanBody.match(/https:\/\/[^\s"'<>)]*discord[^\s"'<>)]*verify[^\s"'<>)]*/i);
+    return fallback ? fallback[0].replace(/[)>.,;'"]+$/, '') : null;
 }
 
 // ─── WEBHOOK DISCORD ALERT ─────────────────────────
@@ -1042,45 +1052,382 @@ async function submitFinalRegistration({ username, email, password, dob, captcha
     return { status: res.status, data: res.data };
 }
 
-async function verifyEmailToken(verifyUrl, token, proxyUrl) {
+async function resendVerificationEmail(token, proxyUrl, accountSessionId = null, fingerprint = null) {
     try {
-        const res1 = await discordHttp({
-            url: verifyUrl,
-            method: 'GET',
+        const superProps = getSuperProperties();
+        const res = await discordHttp({
+            url: `${CONFIG.API_BASE}/auth/verify/resend`,
+            method: 'POST',
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0 Safari/537.36',
-                'Accept': '*/*'
+                'Content-Type': 'application/json',
+                'Authorization': token,
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                'Origin': 'https://discord.com',
+                'Referer': 'https://discord.com/channels/@me',
+                'X-Super-Properties': superProps,
+                ...(fingerprint ? { 'X-Fingerprint': fingerprint } : {})
             },
+            data: {},
             proxy: proxyUrl,
-            timeout: CONFIG.TIMEOUT / 1000
+            timeout: CONFIG.TIMEOUT / 1000,
+            sessionId: accountSessionId
         });
+        return res.status === 204 || res.status === 200;
+    } catch {
+        return false;
+    }
+}
 
-        const tokenMatch = (typeof res1.data === 'string' ? res1.data : JSON.stringify(res1.data)).match(/token=([^&"']+)/)
-            || verifyUrl.match(/token=([^&"']+)/);
+async function verifyEmailToken(verifyUrl, token, proxyUrl, accountSessionId = null, fingerprint = null) {
+    try {
+        let emailToken = null;
 
-        if (tokenMatch) {
-            const emailToken = tokenMatch[1];
-            const res2 = await discordHttp({
-                url: `${CONFIG.API_BASE}/auth/verify`,
-                method: 'POST',
+        // 1. Kiểm tra trực tiếp token trong query param của URL
+        const directMatch = verifyUrl.match(/[?&]token=([^&"'\s<>#]+)/i);
+        if (directMatch) {
+            emailToken = directMatch[1];
+        }
+
+        // 2. Nếu là SendGrid link click.discord.com hoặc chưa có token, GET link để follow redirect
+        if (!emailToken || verifyUrl.includes('click.discord.com')) {
+            const res1 = await discordHttp({
+                url: verifyUrl,
+                method: 'GET',
                 headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': token,
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0 Safari/537.36'
-                },
-                data: {
-                    captcha_key: null,
-                    token: emailToken
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.9'
                 },
                 proxy: proxyUrl,
-                timeout: CONFIG.TIMEOUT / 1000
+                timeout: CONFIG.TIMEOUT / 1000,
+                sessionId: accountSessionId
             });
-            return { success: res2.status === 200, data: res2.data };
+
+            const finalUrl = res1.final_url || '';
+            const matchFinal = finalUrl.match(/[?&]token=([^&"'\s<>#]+)/i);
+            if (matchFinal) {
+                emailToken = matchFinal[1];
+            } else {
+                const loc = res1.headers?.location || res1.headers?.Location || '';
+                const matchLoc = loc.match(/[?&]token=([^&"'\s<>#]+)/i);
+                if (matchLoc) {
+                    emailToken = matchLoc[1];
+                } else {
+                    const bodyStr = typeof res1.data === 'string' ? res1.data : JSON.stringify(res1.data || {});
+                    const matchBody = bodyStr.match(/[?&]token=([^&"'\s<>#]+)/i) || bodyStr.match(/"token":\s*"([^"]+)"/);
+                    if (matchBody) emailToken = matchBody[1];
+                }
+            }
         }
-        return { success: false, error: 'Không tìm thấy verify token trong URL' };
+
+        if (!emailToken) {
+            return { success: false, error: 'Không trích xuất được email token từ link xác thực' };
+        }
+
+        // 3. Gửi verify token lên Discord API
+        const superProps = getSuperProperties();
+        const res2 = await discordHttp({
+            url: `${CONFIG.API_BASE}/auth/verify`,
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': token,
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                'Origin': 'https://discord.com',
+                'Referer': 'https://discord.com/verify',
+                'X-Super-Properties': superProps,
+                ...(fingerprint ? { 'X-Fingerprint': fingerprint } : {})
+            },
+            data: {
+                captcha_key: null,
+                token: emailToken
+            },
+            proxy: proxyUrl,
+            timeout: CONFIG.TIMEOUT / 1000,
+            sessionId: accountSessionId
+        });
+
+        if (res2.status === 200 || res2.status === 201) {
+            const updatedToken = res2.data?.token || token;
+            return { success: true, token: updatedToken, data: res2.data };
+        }
+        return { success: false, error: `HTTP ${res2.status}: ${JSON.stringify(res2.data)}` };
     } catch (err) {
         return { success: false, error: err.message };
     }
+}
+
+// ─── GATEWAY WEBSOCKET WARMUP & HEARTBEAT ─────────
+function connectGatewayWebSocket(token, proxyUrl, durationMs = 12000) {
+    return new Promise((resolve) => {
+        let ws;
+        let heartbeatTimer = null;
+        let finished = false;
+
+        const cleanup = () => {
+            if (finished) return;
+            finished = true;
+            if (heartbeatTimer) clearInterval(heartbeatTimer);
+            try {
+                if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+                    ws.close(1000, 'Normal Closure');
+                }
+            } catch {}
+        };
+
+        const timer = setTimeout(() => {
+            cleanup();
+            resolve(true);
+        }, durationMs);
+
+        try {
+            const wsOpts = {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                    'Origin': 'https://discord.com'
+                }
+            };
+            if (proxyUrl && HttpsProxyAgent) {
+                wsOpts.agent = new HttpsProxyAgent(proxyUrl);
+            }
+
+            ws = new WebSocket('wss://gateway.discord.gg/?v=9&encoding=json', wsOpts);
+
+            ws.on('message', (rawData) => {
+                try {
+                    const msg = JSON.parse(rawData.toString());
+                    // Opcode 10: HELLO -> Bắt đầu Heartbeat & Gửi IDENTIFY
+                    if (msg.op === 10) {
+                        const interval = msg.d.heartbeat_interval;
+                        // Gửi heartbeat đầu tiên
+                        ws.send(JSON.stringify({ op: 1, d: null }));
+                        heartbeatTimer = setInterval(() => {
+                            if (ws.readyState === WebSocket.OPEN) {
+                                ws.send(JSON.stringify({ op: 1, d: null }));
+                            }
+                        }, Math.min(interval, 8000));
+
+                        // Gửi Opcode 2: IDENTIFY (Mô phỏng đầy đủ Discord Web Client)
+                        const identifyPayload = {
+                            op: 2,
+                            d: {
+                                token,
+                                capabilities: 16381,
+                                properties: {
+                                    os: 'Windows',
+                                    browser: 'Chrome',
+                                    device: '',
+                                    system_locale: 'en-US',
+                                    browser_user_agent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                                    browser_version: '131.0.0.0',
+                                    os_version: '10',
+                                    referrer: '',
+                                    referring_domain: '',
+                                    referrer_current: '',
+                                    referring_domain_current: '',
+                                    release_channel: 'stable',
+                                    client_build_number: 345000,
+                                    client_event_source: null
+                                },
+                                presence: {
+                                    status: 'online',
+                                    since: 0,
+                                    activities: [],
+                                    afk: false
+                                },
+                                compress: false,
+                                client_state: {
+                                    guild_versions: {},
+                                    highest_last_message_id: '0',
+                                    read_state_version: 0,
+                                    user_guild_settings_version: -1,
+                                    user_settings_version: -1
+                                }
+                            }
+                        };
+                        ws.send(JSON.stringify(identifyPayload));
+                    }
+                    // Opcode 0: READY -> Discord đã xác nhận session của User
+                    if (msg.op === 0 && msg.t === 'READY') {
+                        // User session đã được thiết lập thành công
+                    }
+                } catch {}
+            });
+
+            ws.on('error', () => {
+                cleanup();
+                clearTimeout(timer);
+                resolve(false);
+            });
+
+            ws.on('close', () => {
+                cleanup();
+                clearTimeout(timer);
+                resolve(true);
+            });
+        } catch {
+            cleanup();
+            clearTimeout(timer);
+            resolve(false);
+        }
+    });
+}
+
+// ─── TOKEN LONG-LIFE WARMUP (PHƯƠNG PHÁP SỐNG 1 THÁNG - 1 NĂM) ───
+async function warmupAccount({ token, proxyUrl, accountSessionId, fingerprint, username }) {
+    console.log(C.blue('\n  🔥 [LIVE WARMUP] Bắt đầu kích hoạt phương pháp nuôi token sống lâu...'));
+
+    // 1. Tham gia HypeSquad House (Tăng Trust Score uy tín cao)
+    try {
+        process.stdout.write(`    ${C.gray('🛡️  Gia nhập HypeSquad House...')} `);
+        const houseId = Math.floor(Math.random() * 3) + 1; // 1: Bravery, 2: Brilliance, 3: Balance
+        const houseNames = { 1: 'Bravery', 2: 'Brilliance', 3: 'Balance' };
+        const res = await discordHttp({
+            url: `${CONFIG.API_BASE}/hypesquad/online`,
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': token,
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                'Origin': 'https://discord.com',
+                'Referer': 'https://discord.com/channels/@me',
+                'X-Super-Properties': getSuperProperties(),
+                ...(fingerprint ? { 'X-Fingerprint': fingerprint } : {})
+            },
+            data: { house_id: houseId },
+            proxy: proxyUrl,
+            timeout: CONFIG.TIMEOUT / 1000,
+            sessionId: accountSessionId
+        });
+        if (res.status === 204 || res.status === 200) {
+            console.log(C.green(`OK (House of ${houseNames[houseId]})`));
+        } else {
+            console.log(C.yellow(`Skip (HTTP ${res.status})`));
+        }
+    } catch {
+        console.log(C.yellow('Skip'));
+    }
+
+    // 2. Thiết lập Client Settings chuẩn (Dark theme, locale en-US, reactions)
+    try {
+        process.stdout.write(`    ${C.gray('⚙️  Cấu hình Client Settings chuẩn (Dark theme, locale)...')} `);
+        const res = await discordHttp({
+            url: `${CONFIG.API_BASE}/users/@me/settings`,
+            method: 'PATCH',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': token,
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                'Origin': 'https://discord.com',
+                'Referer': 'https://discord.com/channels/@me',
+                'X-Super-Properties': getSuperProperties(),
+                ...(fingerprint ? { 'X-Fingerprint': fingerprint } : {})
+            },
+            data: {
+                theme: 'dark',
+                developer_mode: false,
+                animate_emoji: true,
+                render_reactions: true,
+                gif_auto_play: true,
+                inline_attachment_media: true,
+                inline_embed_media: true,
+                enable_tts_command: false,
+                locale: 'en-US',
+                status: 'online'
+            },
+            proxy: proxyUrl,
+            timeout: CONFIG.TIMEOUT / 1000,
+            sessionId: accountSessionId
+        });
+        if (res.status === 200) {
+            console.log(C.green('OK'));
+        } else {
+            console.log(C.yellow(`Skip (HTTP ${res.status})`));
+        }
+    } catch {
+        console.log(C.yellow('Skip'));
+    }
+
+    // 3. Cập nhật Profile Bio & Pronouns tự nhiên
+    try {
+        process.stdout.write(`    ${C.gray('👤 Cập nhật Profile Bio & Pronouns...')} `);
+        const bios = [
+            'just chilling ☕',
+            'gaming and coding 🎮',
+            'listening to music 🎧',
+            'vibing with friends ✨',
+            'silent observer 🌙',
+            'student & tech enthusiast',
+            'lofi beats & good vibes',
+            'afk most of the time 🌿'
+        ];
+        const pronounsList = ['he/him', 'they/them', 'she/her', 'he/they'];
+        const randomBio = bios[Math.floor(Math.random() * bios.length)];
+        const randomPronouns = pronounsList[Math.floor(Math.random() * pronounsList.length)];
+
+        const res = await discordHttp({
+            url: `${CONFIG.API_BASE}/users/%40me/profile`,
+            method: 'PATCH',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': token,
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                'Origin': 'https://discord.com',
+                'Referer': 'https://discord.com/channels/@me',
+                'X-Super-Properties': getSuperProperties(),
+                ...(fingerprint ? { 'X-Fingerprint': fingerprint } : {})
+            },
+            data: {
+                bio: randomBio,
+                pronouns: randomPronouns
+            },
+            proxy: proxyUrl,
+            timeout: CONFIG.TIMEOUT / 1000,
+            sessionId: accountSessionId
+        });
+        if (res.status === 200) {
+            console.log(C.green(`OK ("${randomBio}")`));
+        } else {
+            console.log(C.yellow(`Skip (HTTP ${res.status})`));
+        }
+    } catch {
+        console.log(C.yellow('Skip'));
+    }
+
+    // 4. Mô phỏng Client Navigation Telemetry
+    try {
+        await discordHttp({
+            url: `${CONFIG.API_BASE}/users/@me/library`,
+            method: 'GET',
+            headers: { 'Authorization': token, 'X-Super-Properties': getSuperProperties() },
+            proxy: proxyUrl,
+            timeout: CONFIG.TIMEOUT / 1000,
+            sessionId: accountSessionId
+        });
+        await discordHttp({
+            url: `${CONFIG.API_BASE}/users/@me/affinities/users`,
+            method: 'GET',
+            headers: { 'Authorization': token, 'X-Super-Properties': getSuperProperties() },
+            proxy: proxyUrl,
+            timeout: CONFIG.TIMEOUT / 1000,
+            sessionId: accountSessionId
+        });
+    } catch {}
+
+    // 5. Kết nối Gateway WebSocket & Gửi IDENTIFY (Yếu tố quyết định sống lâu)
+    try {
+        process.stdout.write(`    ${C.gray('🔌 Kết nối Gateway WebSocket (IDENTIFY + 12s Heartbeat)...')} `);
+        const gwSuccess = await connectGatewayWebSocket(token, proxyUrl, 12000);
+        if (gwSuccess) {
+            console.log(C.green('READY (Session active & Heartbeat online)'));
+        } else {
+            console.log(C.yellow('Skip (Gateway timeout)'));
+        }
+    } catch (e) {
+        console.log(C.yellow(`Skip (${e.message})`));
+    }
+
+    console.log(C.green('  ✅ [LIVE WARMUP] Đã hoàn tất kích hoạt! Token có độ tin cậy tối đa.\n'));
 }
 
 // ─── CLI PARSER ────────────────────────────────────
@@ -1093,6 +1440,7 @@ function parseArgs() {
         customEmail: null,
         webhookUrl: CONFIG.WEBHOOK_URL,
         provider: 'tempmaillol',
+        skipWarmup: false,
     };
 
     for (let i = 0; i < args.length; i++) {
@@ -1122,17 +1470,21 @@ function parseArgs() {
             case '-w':
                 opts.webhookUrl = args[++i];
                 break;
+            case '--skip-warmup':
+                opts.skipWarmup = true;
+                break;
             case '-h':
             case '--help':
                 console.log(`
   Usage:
-    node token_register.cjs                   # Đăng ký 1 account (Mặc định tempmail.lol)
+    node token_register.cjs                   # Đăng ký 1 account + Auto Verify Mail + Live Warmup
     node token_register.cjs -n 3              # Đăng ký 3 accounts
     node token_register.cjs --proxy           # Dùng rotating proxy
     node token_register.cjs -u "MyName"       # Tùy chỉnh username
     node token_register.cjs -e "my@email.com" # Dùng email chỉ định
     node token_register.cjs -m tempmaillol    # Chọn provider (tempmaillol / guerrilla / mailtm)
     node token_register.cjs -w "WEBHOOK_URL"  # Webhook Discord nhận alert
+    node token_register.cjs --skip-warmup     # Bỏ qua bước Live Warmup (nếu cần reg nhanh)
                 `);
                 process.exit(0);
         }
@@ -1298,25 +1650,45 @@ async function main() {
 
         // Xử lý kết quả sau khi đăng ký
         if (regSuccess && finalToken) {
-            console.log(`  ${C.green('🎫 Token:')} ${C.dim(finalToken)}`);
+            console.log(`  ${C.green('🎫 Token Ban Đầu:')} ${C.dim(finalToken)}`);
 
             // Verify email nếu có hỗ trợ
             let emailVerified = false;
             if (activeEmailObj && activeEmailObj.pollVerifyLink) {
                 console.log(C.gray('  📧 Đang chờ link verify từ hộp thư đến...'));
-                const verifyLink = await activeEmailObj.pollVerifyLink(30000);
+
+                // Tự động trigger gửi lại mail sau 5 giây nếu chưa nhận được
+                const resendTimer = setTimeout(async () => {
+                    await resendVerificationEmail(finalToken, proxyObj ? proxyObj.url : null, accountSessionId, fingerprint);
+                }, 5000);
+
+                const verifyLink = await activeEmailObj.pollVerifyLink(45000);
+                clearTimeout(resendTimer);
+
                 if (verifyLink) {
                     process.stdout.write(`  ${C.blue('📧 Xác thực Email token...')} `);
-                    const vRes = await verifyEmailToken(verifyLink, finalToken, proxyObj ? proxyObj.url : null);
+                    const vRes = await verifyEmailToken(verifyLink, finalToken, proxyObj ? proxyObj.url : null, accountSessionId, fingerprint);
                     if (vRes.success) {
                         emailVerified = true;
+                        if (vRes.token) finalToken = vRes.token;
                         console.log(C.bgGreen('VERIFIED'));
                     } else {
-                        console.log(C.yellow('SKIP (Không xác thực được link)'));
+                        console.log(C.yellow(`SKIP (${vRes.error || 'Lỗi link'})`));
                     }
                 } else {
-                    console.log(C.yellow('  ⚠  Không nhận được email verify kịp thời (Token vẫn hoạt động bình thường)'));
+                    console.log(C.yellow('  ⚠  Không nhận được email verify kịp thời (Token vẫn hoạt động)'));
                 }
+            }
+
+            // Kích hoạt cơ chế Live Warmup (giúp token sống lâu 1 tháng - 1 năm)
+            if (!opts.skipWarmup) {
+                await warmupAccount({
+                    token: finalToken,
+                    proxyUrl: proxyObj ? proxyObj.url : null,
+                    accountSessionId,
+                    fingerprint,
+                    username
+                });
             }
 
             // 1. Lưu lập tức vào file TXT (Append)
