@@ -1,0 +1,4 @@
+# Định dạng Proxy: ip:port:username:password hoặc ip:port
+# Ví dụ:
+# 192.168.1.100:8080:user:pass
+# 192.168.1.101:8080

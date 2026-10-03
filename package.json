@@ -1,0 +1,14 @@
+{
+  "name": "discord-tool-reg",
+  "version": "2.0.0",
+  "description": "Discord Account Generator & Token Checker Suite",
+  "main": "token_register.cjs",
+  "scripts": {
+    "reg": "node token_register.cjs",
+    "check": "node token_checker.cjs"
+  },
+  "dependencies": {
+    "axios": "^1.7.9",
+    "https-proxy-agent": "^7.0.6"
+  }
+}
